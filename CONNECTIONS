@@ -1,0 +1,55 @@
+===================================================================
+                    MASTER HARDWARE PIN CONNECTION MAP
+===================================================================
+
+[ POWER & GROUND RAILS ]
+-------------------------------------------------------------------
+ESP32 5V (or VIN) --->  Positive (+) Long Rail on Breadboard (5V)
+ESP32 3.3V        --->  Second Positive (+) Rail on Breadboard (3.3V)
+ESP32 GND         --->  Negative (-) Long Rail on Breadboard (GND)
+
+
+[ SH1106 OLED SCREEN (I2C) ]
+-------------------------------------------------------------------
+OLED GND          --->  GND Rail
+OLED VCC          --->  3.3V Rail (Do not connect to 5V)
+OLED SCL          --->  ESP32 GPIO 22
+OLED SDA          --->  ESP32 GPIO 21
+
+
+[ MICRO SD CARD MODULE (Hardware VSPI) ]
+-------------------------------------------------------------------
+SD MODULE GND     --->  GND Rail
+SD MODULE VCC     --->  5V Rail (For voltage regulator stability)
+SD MODULE MISO    --->  ESP32 GPIO 19
+SD MODULE MOSI    --->  ESP32 GPIO 23
+SD MODULE SCK     --->  ESP32 GPIO 18
+SD MODULE CS      --->  ESP32 GPIO 5
+
+
+[ RGB LED (Common Cathode) ]
+-------------------------------------------------------------------
+RED Leg           --->  ESP32 GPIO 14 (via 220Ω Resistor)
+GREEN Leg         --->  ESP32 GPIO 27 (via 220Ω Resistor)
+BLUE Leg          --->  ESP32 GPIO 26 (via 220Ω Resistor)
+GND Leg (Longest) --->  GND Rail
+
+
+[ DHT11 TEMPERATURE & HUMIDITY SENSOR ]
+-------------------------------------------------------------------
+DHT11 GND         --->  GND Rail
+DHT11 VCC         --->  3.3V Rail
+DHT11 DATA        --->  ESP32 GPIO 32
+
+
+[ PASSIVE BUZZER ]
+-------------------------------------------------------------------
+BUZZER Positive(+)--->  ESP32 GPIO 25
+BUZZER Negative(-)--->  GND Rail
+
+
+[ PHYSICAL PUSH BUTTON ]
+-------------------------------------------------------------------
+BUTTON Pin 1      --->  ESP32 GPIO 4
+BUTTON Pin 2      --->  GND Rail
+===================================================================
