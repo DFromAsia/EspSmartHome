@@ -1,0 +1,1442 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+
+#include <WebServer.h>
+#include <SPI.h>
+#include <SD.h>
+#include <FS.h>
+
+#include "time.h"
+#include <DHT.h>
+#include <math.h>
+
+// =====================================================
+// OLED
+// =====================================================
+
+Adafruit_SH1106G display(128,
+  64,
+  &Wire,
+  -1
+);
+
+// =====================================================
+// OFFLINE MUSIC MODE - WEB SERVER & PAGE
+// =====================================================
+
+WebServer server(80);
+bool musicPlayerActive = false; // True after user presses ENTER on webpage
+String currentLyricLine = "---";
+
+const char* musicPlayerPage PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 Music</title>
+    <style>
+        body { background: #0f172a; color: #e2e8f0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 15px; text-align: center; }
+        .container { max-width: 600px; margin: auto; }
+        #enter-screen h1 { color: #00f0ff; }
+        #enter-screen p { color: #828fa3; }
+        button { background: #10b981; color: #fff; border: none; padding: 15px 30px; font-size: 18px; border-radius: 8px; cursor: pointer; transition: background 0.2s; margin-top: 20px; }
+        button:hover { background: #00cc6d; }
+        #player-screen { display: none; }
+        h2 { color: #00f0ff; border-bottom: 1px solid #2a344f; padding-bottom: 10px; margin-top: 0; }
+        ul { list-style: none; padding: 0; text-align: left; }
+        li { display: flex; align-items: center; padding: 15px; background: rgba(18, 24, 43, 0.65); border-radius: 8px; margin-bottom: 10px; cursor: pointer; transition: background 0.2s; }
+        li:hover, li.active { background: #2a344f; }
+        .fav-star { font-size: 20px; margin-right: 15px; color: #828fa3; cursor: pointer; }
+        .fav-star.is-fav { color: #ffc107; }
+        .player-controls { margin-top: 20px; }
+        audio { width: 100%; }
+        .track-controls { display: flex; justify-content: center; align-items: center; gap: 20px; margin-top: 15px; }
+        .track-controls button { background: #2a344f; color: #e2e8f0; border-radius: 50%; width: 60px; height: 60px; font-size: 24px; margin: 0; padding: 0; line-height: 60px; }
+        .track-controls button:hover { background: #3b486b; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div id="enter-screen">
+            <h1>Offline Music Mode</h1>
+            <p>Sync your device time and enter the music player.</p>
+            <button id="enter-btn">Sync Time & Enter</button>
+        </div>
+
+        <div id="player-screen">
+            <h2>Playlist</h2>
+            <ul id="playlist"></ul>
+            <div class="player-controls">
+                <audio id="audio-player" controls></audio>
+                <div class="track-controls">
+                    <button id="prev-btn">⏮</button>
+                    <button id="rw-btn">⏪</button>
+                    <button id="ff-btn">⏩</button>
+                    <button id="next-btn">⏭</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const enterBtn = document.getElementById('enter-btn');
+        const enterScreen = document.getElementById('enter-screen');
+        const playerScreen = document.getElementById('player-screen');
+        const playlistEl = document.getElementById('playlist');
+        const audioPlayer = document.getElementById('audio-player');
+        const prevBtn = document.getElementById('prev-btn');
+        const nextBtn = document.getElementById('next-btn');
+        const rwBtn = document.getElementById('rw-btn');
+        const ffBtn = document.getElementById('ff-btn');
+
+        let lyrics = [];
+        let currentLyricIndex = -1;
+        let songs = [];
+        let favorites = new Set();
+        let currentSongIndex = -1;
+
+        enterBtn.addEventListener('click', async () => {
+            try {
+                await fetch(`/timesync?time=${Date.now()}`);
+                await fetch('/enter');
+                enterScreen.style.display = 'none';
+                playerScreen.style.display = 'block';
+                await loadSongs();
+                if (songs.length > 0) playSong(0);
+            } catch (e) {
+                console.error('Failed to enter player mode', e);
+            }
+        });
+
+        async function loadSongs() {
+            try {
+                const response = await fetch('/songs');
+                const data = await response.json();
+                songs = data.songs || [];
+                favorites = new Set(data.favorites || []);
+                
+                playlistEl.innerHTML = '';
+                songs.forEach((song, index) => {
+                    const li = document.createElement('li');
+                    li.dataset.index = index;
+
+                    const star = document.createElement('span');
+                    star.className = 'fav-star';
+                    star.textContent = favorites.has(song) ? '★' : '☆';
+                    if (favorites.has(song)) star.classList.add('is-fav');
+                    star.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        toggleFavorite(song, star);
+                    });
+
+                    const title = document.createElement('span');
+                    title.textContent = song.split('/').pop().replace('.mp3', '');
+
+                    li.appendChild(star);
+                    li.appendChild(title);
+                    li.addEventListener('click', () => playSong(index));
+                    playlistEl.appendChild(li);
+                });
+            } catch (e) {
+                console.error("Failed to load songs:", e);
+            }
+        }
+
+        async function toggleFavorite(songFile, starElement) {
+            const isFavorite = favorites.has(songFile);
+            const action = isFavorite ? 'remove' : 'add';
+            // Note: 'remove' is not implemented in this version on the backend,
+            // but we can build the UI for it. For now, we only add.
+            if (action === 'add') {
+                try {
+                    await fetch(`/fav?add=${encodeURIComponent(songFile)}`);
+                    favorites.add(songFile);
+                    starElement.textContent = '★';
+                    starElement.classList.add('is-fav');
+                } catch (e) {
+                    console.error("Failed to add favorite", e);
+                }
+            }
+        }
+
+        async function playSong(index) {
+            if (index < 0 || index >= songs.length) return;
+            currentSongIndex = index;
+
+            document.querySelectorAll('#playlist li').forEach(el => {
+                el.classList.toggle('active', parseInt(el.dataset.index) === index);
+            });
+
+            const songFile = songs[index];
+            const audioUrl = songFile.startsWith('/') ? songFile : `/music/${songFile}`;
+            
+            // SHOW SONG NAME INITIALLY
+            const songName = songFile.split('/').pop().replace('.mp3', '');
+            fetch(`/sync?line=${encodeURIComponent(songName)}`).catch(()=>{});
+            
+            const thisSongIndex = index;
+            audioPlayer.src = audioUrl;
+            audioPlayer.play().catch(e => console.error("Playback failed:", e));
+
+            const lyricUrl = audioUrl.replace('.mp3', '.lrc');
+            let hasLyrics = false;
+            try {
+                const response = await fetch(lyricUrl);
+                if (response.ok) {
+                    const lrcText = await response.text();
+                    parseLRC(lrcText);
+                    hasLyrics = true;
+                } else {
+                    lyrics = []; // No lyrics found
+                }
+            } catch (e) {
+                lyrics = [];
+            }
+
+            setTimeout(() => {
+                if (currentSongIndex === thisSongIndex && currentLyricIndex === -1) {
+                    fetch(`/sync?line=${hasLyrics ? '---' : 'No Lyrics'}`).catch(()=>{});
+                }
+            }, 1000);
+        }
+
+        function parseLRC(text) {
+            lyrics = [];
+            currentLyricIndex = -1;
+
+            const lines = text.split(/\r?\n/);
+
+            for (const line of lines) {
+                const match = line.match(/\[(\d{2}):(\d{2})\.(\d{2,3})\](.*)/);
+
+                if (match) {
+                    const min = parseInt(match[1], 10);
+                    const sec = parseInt(match[2], 10);
+                    const ms = parseInt(match[3].padEnd(3,'0'), 10);
+
+                    const time = min * 60 + sec + ms / 1000;
+
+                    const text = match[4].trim();
+
+                    if (text) {
+                        lyrics.push({ time, text });
+                    }
+                }
+            }
+        }
+
+        audioPlayer.addEventListener('timeupdate', () => {
+            if (!lyrics.length) return;
+            const currentTime = audioPlayer.currentTime;
+            let lyricIndex = -1;
+            for (let i = lyrics.length - 1; i >= 0; i--) {
+                if (currentTime >= lyrics[i].time) {
+                    lyricIndex = i;
+                    break;
+                }
+            }
+
+            if (lyricIndex !== currentLyricIndex) {
+                currentLyricIndex = lyricIndex;
+                if (lyricIndex !== -1) {
+                    fetch(`/sync?line=${encodeURIComponent(lyrics[lyricIndex].text)}`).catch(()=>{});
+                } else {
+                    fetch('/sync?line=---').catch(()=>{});
+                }
+            }
+        });
+
+        let audioCtx;
+        let analyser;
+        let dataArray;
+
+        audioPlayer.addEventListener('play', () => {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                const source = audioCtx.createMediaElementSource(audioPlayer);
+                analyser = audioCtx.createAnalyser();
+                analyser.fftSize = 64;
+                source.connect(analyser);
+                analyser.connect(audioCtx.destination);
+                dataArray = new Uint8Array(analyser.frequencyBinCount);
+                
+                setInterval(() => {
+                    if (!audioPlayer.paused) {
+                        analyser.getByteFrequencyData(dataArray);
+                        let sum = 0;
+                        for(let i=0; i<dataArray.length; i++) sum += dataArray[i];
+                        let avg = sum / dataArray.length;
+                        fetch(`/visualizer?amp=${avg}`, { mode: 'no-cors' }).catch(()=>{});
+                    }
+                }, 300);
+            }
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+        });
+
+        prevBtn.addEventListener('click', () => playSong((currentSongIndex - 1 + songs.length) % songs.length));
+        nextBtn.addEventListener('click', () => playSong((currentSongIndex + 1) % songs.length));
+        rwBtn.addEventListener('click', () => { audioPlayer.currentTime = Math.max(0, audioPlayer.currentTime - 10); });
+        ffBtn.addEventListener('click', () => { audioPlayer.currentTime += 10; });
+        audioPlayer.addEventListener('ended', () => nextBtn.click());
+
+    </script>
+</body>
+</html>
+)rawliteral";
+
+// =====================================================
+// WIFI
+// =====================================================
+
+const char* ssid = "KARTHIKEYAN";
+const char* password = "1234567899";
+const char* ap_ssid = "esp32";
+const char* ap_password = "12345678";
+
+// =====================================================
+// SD CARD
+// =====================================================
+
+#define SD_CS 5
+
+// =====================================================
+// FIREBASE
+// =====================================================
+
+const char* firebaseURL =
+"FIREBASE_DATABASE_URL_HERE/.json";
+
+// =====================================================
+// TIME
+// =====================================================
+
+const char* ntpServer =
+"pool.ntp.org";
+
+const long gmtOffset_sec = 19800;
+const int daylightOffset_sec = 0;
+
+// =====================================================
+// RGB
+// =====================================================
+
+#define RED_PIN    14
+#define GREEN_PIN  27
+#define BLUE_PIN   26
+
+// =====================================================
+// BUZZER
+// =====================================================
+
+#define BUZZER_PIN 25
+
+// =====================================================
+// CLOCK
+// =====================================================
+
+const int cx = 64;
+const int cy = 32;
+const int radius = 30;
+
+// =====================================================
+// VARIABLES
+// =====================================================
+
+String displayType = "analog";
+bool offlineMusicMode = false;
+bool wifiConnected = false;
+bool ntpSynced = false;
+
+// DHT SENSOR
+#define DHTPIN 32
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+float roomTemp = 0.0;
+float roomHum = 0.0;
+unsigned long lastDHTRead = 0;
+unsigned long lastDHTFirebaseUpdate = 0;
+
+// BUTTON
+#define BUTTON_PIN 4
+bool lastButtonState = HIGH;
+unsigned long buttonPressTime = 0;
+bool buttonPressed = false;
+bool buttonHandled = false;
+
+// RINGING
+bool isTimerRinging = false;
+unsigned long timerRingStart = 0;
+bool isAlarmRinging = false;
+unsigned long alarmRingStart = 0;
+unsigned long lastRingToggle = 0;
+bool ringToggleState = false;
+
+unsigned long lastFirebaseRead = 0;
+unsigned long lastReconnectTry = 0;
+unsigned long lastHeartbeat = 0;
+unsigned long lastClockDraw = 0;
+unsigned long lastHourlyBeep = 0;
+
+// RGB
+String rgbMode = "cycle";
+int rgbBrightness = 128;
+int solidR = 255;
+int solidG = 255;
+int solidB = 255;
+
+// MESSAGE
+String currentMessage = "";
+bool newMessageAvailable = false;
+bool messageDisplaying = false;
+unsigned long messageStartTime = 0;
+
+// TIMER
+bool timerRunning = false;
+int timerSeconds = 0;
+unsigned long lastTimerTick = 0;
+
+// ALARM
+bool alarmEnabled = false;
+bool alarmTriggered = false;
+String alarmTime = "";
+String alarmMessage = "ALARM";
+
+// OFFLINE MUSIC STATES
+String lastDisplayedLyric = "";
+bool lastMusicPlayerActive = false;
+unsigned long lastInteractionTime = 0;
+
+// CORE 0 TASK HANDLE
+TaskHandle_t firebaseTask;
+
+WiFiClientSecure secureClientCore0;
+WiFiClientSecure secureClientCore1;
+
+// =====================================================
+// OFFLINE TIME
+// =====================================================
+
+time_t savedEpoch = 0;
+unsigned long savedMillis = 0;
+
+// =====================================================
+// CURRENT TIME
+// =====================================================
+
+time_t getCurrentTime() {
+  time_t now = time(nullptr);
+  if (now > 1600000000) { // If time is set by SNTP (year > 2020), use the system RTC directly
+    return now;
+  }
+  return savedEpoch + ((millis() - savedMillis) / 1000); // Fallback for offline manual sync
+}
+
+// =====================================================
+// OFFLINE MUSIC MODE - SERVER HANDLERS
+// =====================================================
+
+void handleMusicRoot() { server.send(200, "text/html", musicPlayerPage); }
+
+void handleNotFound() { server.send(404, "text/plain", "Not found"); }
+
+void handleEnter() {
+  lastInteractionTime = millis();
+  musicPlayerActive = true;
+  server.send(200, "text/plain", "OK");
+}
+
+void handleTimeSync() {
+  lastInteractionTime = millis();
+  if (server.hasArg("time")) {
+    String timeStr = server.arg("time");
+    long long ms = atoll(timeStr.c_str());
+    savedEpoch = ms / 1000;
+    savedMillis = millis();
+  }
+  server.send(200, "text/plain", "Time Synced");
+}
+
+void handleLyricSync() {
+  lastInteractionTime = millis();
+  if (server.hasArg("line")) {
+    currentLyricLine = server.arg("line");
+    currentLyricLine.replace("+", " ");
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSongList() {
+  File musicDir = SD.open("/music");
+  if (!musicDir || !musicDir.isDirectory()) {
+    server.send(500, "text/plain", "Failed to open /music directory");
+    return;
+  }
+
+  String songsJson = "[";
+  File file = musicDir.openNextFile();
+  bool first = true;
+  while (file) {
+    if (String(file.name()).endsWith(".mp3")) {
+      if (!first) songsJson += ",";
+      songsJson += "\"" + String(file.name()) + "\"";
+      first = false;
+    }
+    file.close();
+    file = musicDir.openNextFile();
+  }
+  songsJson += "]";
+  musicDir.close();
+
+  String favsJson = "[";
+  File favFile = SD.open("/favorites.txt", FILE_READ);
+  if (favFile) {
+    first = true;
+    while (favFile.available()) {
+      String line = favFile.readStringUntil('\n');
+      line.trim();
+      if (line.length() > 0) {
+        if (!first) favsJson += ",";
+        favsJson += "\"" + line + "\"";
+        first = false;
+      }
+    }
+    favFile.close();
+  }
+  favsJson += "]";
+
+  String json = "{\"songs\":" + songsJson + ",\"favorites\":" + favsJson + "}";
+  server.send(200, "application/json", json);
+}
+
+void handleFav() {
+  lastInteractionTime = millis();
+  if (server.hasArg("add")) {
+    String songToAdd = server.arg("add");
+    
+    bool exists = false;
+    File checkFile = SD.open("/favorites.txt", FILE_READ);
+    if (checkFile) {
+      while (checkFile.available()) {
+        String line = checkFile.readStringUntil('\n');
+        line.trim();
+        if (line == songToAdd) {
+          exists = true;
+          break;
+        }
+      }
+      checkFile.close();
+    }
+    
+    if (!exists) {
+      File favFile = SD.open("/favorites.txt", FILE_APPEND);
+      if (favFile) {
+        favFile.println(songToAdd);
+        favFile.close();
+        server.send(200, "text/plain", "Added");
+        return;
+      }
+      server.send(500, "text/plain", "Failed to open favorites file");
+    } else {
+      server.send(200, "text/plain", "Already exists");
+    }
+  } else {
+    server.send(400, "text/plain", "Bad Request");
+  }
+}
+
+void handleVisualizer() {
+  lastInteractionTime = millis();
+  if (server.hasArg("amp")) {
+    int amp = server.arg("amp").toInt();
+    int r = 0, g = 0, b = 0;
+    if (amp > 10) { 
+      r = map(amp, 0, 255, 0, 255);
+      b = map(255 - amp, 0, 255, 0, 255);
+      g = (amp > 150) ? map(amp, 150, 255, 0, 255) : 0;
+    }
+    setRGB(r, g, b);
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleFileStream() {
+  String path = server.urlDecode(server.uri());
+  if (path.endsWith("/")) {
+    path += "index.html";
+  }
+  String contentType = "text/plain";
+  if (path.endsWith(".mp3")) {
+    contentType = "audio/mpeg";
+  } else if (path.endsWith(".lrc")) {
+    contentType = "text/plain";
+  }
+
+  if (SD.exists(path)) {
+    File file = SD.open(path, FILE_READ);
+    server.sendHeader("Accept-Ranges", "bytes");
+    server.streamFile(file, contentType);
+    file.close();
+  } else {
+    handleNotFound();
+  }
+}
+
+void startOfflineMusicMode() {
+  offlineMusicMode = true;
+  musicPlayerActive = false;
+  currentLyricLine = "---";
+
+  // Only suspend the task if its handle is valid (i.e., it has been created)
+  if (firebaseTask != NULL) {
+    vTaskSuspend(firebaseTask);
+  }
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ap_ssid, ap_password);
+
+  server.on("/", HTTP_GET, handleMusicRoot);
+  server.on("/songs", HTTP_GET, handleSongList);
+  server.on("/enter", HTTP_GET, handleEnter);
+  server.on("/timesync", HTTP_GET, handleTimeSync);
+  server.on("/sync", HTTP_GET, handleLyricSync);
+  server.on("/fav", HTTP_GET, handleFav);
+  server.on("/visualizer", HTTP_GET, handleVisualizer);
+  server.onNotFound(handleFileStream); // For /music/*.mp3 and /music/*.lrc
+
+  server.begin();
+  setRGB(0, 0, 0);
+}
+
+void stopOfflineMusicMode() {
+  offlineMusicMode = false;
+  server.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  
+  centerText("Exiting...", 2);
+  delay(1000);
+
+  ntpSynced = false; // We will need to re-sync time when we get back online
+  wifiConnected = false; // Reset connection state to re-trigger configTime
+  lastReconnectTry = 0; // Force a reconnect attempt to home WiFi
+  // Only resume the task if its handle is valid
+  if (firebaseTask != NULL) {
+    vTaskResume(firebaseTask);
+  }
+}
+
+void handleButton(); // Forward declaration
+
+// =====================================================
+// CENTER TEXT
+// =====================================================
+
+String wrapText(String text, int maxChars) {
+  String result = "";
+  String currentLine = "";
+  String currentWord = "";
+
+  for (int i = 0; i < text.length(); i++) {
+    char c = text[i];
+    if (c == ' ' || c == '\n') {
+      if (currentWord.length() > 0) {
+        if (currentLine.length() + currentWord.length() + (currentLine.length() > 0 ? 1 : 0) > maxChars) {
+          if (result.length() > 0) result += "\n";
+          result += currentLine;
+          currentLine = currentWord;
+        } else {
+          if (currentLine.length() > 0) currentLine += " ";
+          currentLine += currentWord;
+        }
+        currentWord = "";
+      }
+      
+      if (c == '\n') {
+        if (result.length() > 0) result += "\n";
+        result += currentLine;
+        currentLine = "";
+      }
+    } else {
+      currentWord += c;
+      if (currentWord.length() >= maxChars) {
+        if (currentLine.length() > 0) {
+          if (result.length() > 0) result += "\n";
+          result += currentLine;
+          currentLine = "";
+        }
+        if (result.length() > 0) result += "\n";
+        result += currentWord;
+        currentWord = "";
+      }
+    }
+  }
+  
+  if (currentWord.length() > 0) {
+    if (currentLine.length() + currentWord.length() + (currentLine.length() > 0 ? 1 : 0) > maxChars) {
+      if (currentLine.length() > 0) {
+        if (result.length() > 0) result += "\n";
+        result += currentLine;
+      }
+      currentLine = currentWord;
+    } else {
+      if (currentLine.length() > 0) currentLine += " ";
+      currentLine += currentWord;
+    }
+  }
+  
+  if (currentLine.length() > 0) {
+    if (result.length() > 0) result += "\n";
+    result += currentLine;
+  }
+  return result;
+}
+
+void centerText(String text, int size) {
+  display.clearDisplay();
+  display.setTextSize(size);
+  display.setTextWrap(false);
+
+  int numLines = 1;
+  for (int i = 0; i < text.length(); i++) {
+    if (text[i] == '\n') numLines++;
+  }
+
+  int charHeight = 8 * size; 
+  int totalHeight = numLines * charHeight;
+  int startY = (64 - totalHeight) / 2;
+
+  int startIndex = 0;
+  for (int i = 0; i < numLines; i++) {
+    int endIndex = text.indexOf('\n', startIndex);
+    if (endIndex == -1) endIndex = text.length();
+    
+    String line = text.substring(startIndex, endIndex);
+    
+    int16_t x1, y1;
+    uint16_t w, h;
+    display.getTextBounds(line.c_str(), 0, 0, &x1, &y1, &w, &h);
+    
+    int x = (128 - w) / 2;
+    if (x < 0) x = 0;
+    int y = startY + (i * charHeight);
+    
+    display.setCursor(x, y);
+    display.println(line);
+    
+    startIndex = endIndex + 1;
+  }
+  display.display();
+}
+
+// =====================================================
+// RGB (UPDATED FOR ESP32 CORE v3.x)
+// =====================================================
+
+void setRGB(int r, int g, int b) {
+  r = (r * rgbBrightness) / 255;
+  g = (g * rgbBrightness) / 255;
+  b = (b * rgbBrightness) / 255;
+
+  ledcWrite(RED_PIN, r);
+  ledcWrite(GREEN_PIN, g);
+  ledcWrite(BLUE_PIN, b);
+}
+
+// =====================================================
+// RGB CYCLE
+// =====================================================
+
+void updateRGBCycle() {
+  float t = (millis() % 30000) / 30000.0;
+  float r, g, b;
+
+  if (t < 0.333) {
+    float p = t / 0.333;
+    r = 255 * (1 - p);
+    g = 255 * p;
+    b = 0;
+  } else if (t < 0.666) {
+    float p = (t - 0.333) / 0.333;
+    r = 0;
+    g = 255 * (1 - p);
+    b = 255 * p;
+  } else {
+    float p = (t - 0.666) / 0.334;
+    r = 255 * p;
+    g = 0;
+    b = 255 * (1 - p);
+  }
+
+  setRGB(r, g, b);
+}
+
+// =====================================================
+// WIFI CONNECT (ONLY RUNS AT BOOT)
+// =====================================================
+
+void connectWiFi() {
+  centerText("Connecting WiFi", 1);
+  WiFi.disconnect();
+  WiFi.begin(ssid, password);
+  
+  unsigned long connectStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - connectStart < 15000) { // 15s timeout
+    // Allow long-press to interrupt connection attempt
+    if (digitalRead(BUTTON_PIN) == LOW) {
+        unsigned long pressTime = millis();
+        while(digitalRead(BUTTON_PIN) == LOW); // wait for release
+        if (millis() - pressTime > 3000) {
+            startOfflineMusicMode();
+            return; // Exit connection attempt and go straight to music mode
+        }
+    }
+
+    setRGB(0,0,120);
+    delay(100);
+    setRGB(0,0,0);
+    delay(100);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    centerText("Scanning Open", 1);
+    int n = WiFi.scanNetworks();
+    for (int i = 0; i < n; ++i) {
+      if (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) {
+        String openSSID = WiFi.SSID(i);
+        centerText("Connecting:\n" + openSSID, 1);
+        WiFi.begin(openSSID.c_str());
+        unsigned long openConnectStart = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - openConnectStart < 10000) {
+          setRGB(120,0,120);
+          delay(100);
+          setRGB(0,0,0);
+          delay(100);
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+          break;
+        }
+      }
+    }
+  }
+
+  if (WiFi.status() == WL_CONNECTED && !offlineMusicMode) {
+    wifiConnected = true;
+    centerText("WiFi Connected", 1);
+    delay(1000);
+    
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    struct tm timeinfo;
+    if(getLocalTime(&timeinfo, 5000)) {
+      savedEpoch = time(nullptr);
+      savedMillis = millis();
+      ntpSynced = true;
+    }
+  } else if (!offlineMusicMode) {
+    centerText("WiFi Failed", 1);
+    delay(2000);
+  }
+}
+
+// =====================================================
+// WIFI CHECK (SILENT 10s BACKGROUND RECONNECT)
+// =====================================================
+
+void checkWiFi() {
+  if (offlineMusicMode) return;
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiConnected) {
+      wifiConnected = true;
+      configTime(gmtOffset_sec, daylightOffset_sec, ntpServer); // Re-initialize SNTP on reconnect
+    }
+    return;
+  }
+
+  wifiConnected = false;
+  ntpSynced = false; // Connection is down, so we are no longer NTP synced
+  
+  // Silently try to reconnect every 10 seconds without blocking the UI
+  if (millis() - lastReconnectTry > 10000) {
+    lastReconnectTry = millis();
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+  }
+}
+
+// =====================================================
+// DIGITAL CLOCK
+// =====================================================
+
+void drawDigitalClock() {
+  time_t now = getCurrentTime();
+  struct tm* timeinfo = localtime(&now);
+  char timeString[20];
+
+  strftime(timeString, sizeof(timeString), "%I:%M:%S", timeinfo);
+  
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(0, 24);
+  display.println(timeString);
+  display.display();
+}
+
+// =====================================================
+// ANALOG CLOCK
+// =====================================================
+
+void drawAnalogClock() {
+  time_t now = getCurrentTime();
+  struct tm* timeinfo = localtime(&now);
+
+  int sec = timeinfo->tm_sec;
+  int min = timeinfo->tm_min;
+  int hour = timeinfo->tm_hour;
+
+  if (hour > 12) hour -= 12;
+  
+  float secAngle = sec * 6;
+  float minAngle = min * 6 + sec * 0.1;
+  float hourAngle = hour * 30 + min * 0.5;
+
+  display.clearDisplay();
+  display.drawCircle(cx, cy, radius, SH110X_WHITE);
+  
+  for (int i = 0; i < 12; i++) {
+    float angle = (i * 30 - 90) * PI / 180;
+    int x1 = cx + cos(angle) * (radius - 2);
+    int y1 = cy + sin(angle) * (radius - 2);
+    int x2 = cx + cos(angle) * radius;
+    int y2 = cy + sin(angle) * radius;
+    display.drawLine(x1, y1, x2, y2, SH110X_WHITE);
+  }
+
+  float secRad = (secAngle - 90) * PI / 180;
+  float minRad = (minAngle - 90) * PI / 180;
+  float hourRad = (hourAngle - 90) * PI / 180;
+  
+  int sx = cx + cos(secRad) * (radius - 2);
+  int sy = cy + sin(secRad) * (radius - 2);
+  int mx = cx + cos(minRad) * (radius - 6);
+  int my = cy + sin(minRad) * (radius - 6);
+  int hx = cx + cos(hourRad) * (radius - 14);
+  int hy = cy + sin(hourRad) * (radius - 14);
+  
+  display.drawLine(cx, cy, sx, sy, SH110X_WHITE);
+  display.drawLine(cx, cy, mx, my, SH110X_WHITE);
+  display.drawLine(cx, cy, hx, hy, SH110X_WHITE);
+  display.fillCircle(cx, cy, 2, SH110X_WHITE);
+
+  display.display();
+}
+
+// =====================================================
+// FIREBASE
+// =====================================================
+
+void readFirebase() {
+  HTTPClient http;
+  http.begin(secureClientCore0, firebaseURL);
+  int code = http.GET();
+
+  if (code == 200) {
+    String payload = http.getString();
+    DynamicJsonDocument doc(8192);
+    deserializeJson(doc, payload);
+
+    // DISPLAY TYPE
+    displayType = doc["display"]["type"] | "analog";
+
+    // RGB
+    rgbMode = doc["rgb"]["mode"] | "cycle";
+    rgbBrightness = doc["rgb"]["brightness"] | 128;
+    solidR = doc["rgb"]["r"] | 255;
+    solidG = doc["rgb"]["g"] | 255;
+    solidB = doc["rgb"]["b"] | 255;
+
+    // MESSAGE 
+    bool newMessage = doc["message"]["new"] | false;
+    if (newMessage && !timerRunning && !alarmTriggered) {
+      currentMessage = doc["message"]["text"] | "";
+      newMessageAvailable = true;
+    }
+
+    // TIMER
+    bool incomingTimer = doc["timer"]["running"] | false;
+    int incomingSeconds = doc["timer"]["seconds"] | 0;
+    
+    if (incomingTimer && !timerRunning && incomingSeconds > 0) {
+      timerRunning = true;
+      timerSeconds = incomingSeconds;
+      lastTimerTick = millis();
+    }
+
+    if (!incomingTimer && timerRunning) {
+      timerRunning = false;
+    }
+
+    // ALARM
+    alarmEnabled = doc["alarm"]["enabled"] | false;
+    alarmTime = doc["alarm"]["time"] | "";
+    alarmMessage = doc["alarm"]["message"] | "ALARM";
+  }
+  http.end();
+}
+
+// =====================================================
+// HEARTBEAT
+// =====================================================
+
+void sendHeartbeat() {
+  HTTPClient http;
+  http.begin(secureClientCore0, "FIREBASE_DATABASE_URL_HERE/system/lastSeen.json");
+  http.addHeader("Content-Type", "application/json");
+  http.PUT(String(time(nullptr)));
+  http.end();
+}
+
+// =====================================================
+// DUAL-CORE NETWORK TASK (RUNS ON CORE 0)
+// =====================================================
+
+void firebaseTaskCode(void * parameter) {
+  for(;;) {
+    // This task is suspended entirely during offlineMusicMode
+
+    // NTP Time Sync Logic: Always try to sync if we have WiFi but haven't synced yet.
+    if (wifiConnected && !ntpSynced) {
+      struct tm timeinfo;
+      if(getLocalTime(&timeinfo, 5000)) { // Increased wait for successful sync
+        savedEpoch = time(nullptr);
+        savedMillis = millis();
+        ntpSynced = true; // Success!
+      }
+    }
+
+    if (wifiConnected && !timerRunning) {
+      
+      // Fast polling: Checks website every 1.5 seconds for instant response
+      if (millis() - lastFirebaseRead > 5000) {
+        lastFirebaseRead = millis();
+        readFirebase();
+      }
+
+      // Heartbeat: Sends ONLINE status exactly every 5 mins (300,000 ms)
+      if (millis() - lastHeartbeat > 300000) {
+        lastHeartbeat = millis();
+        sendHeartbeat();
+      }
+
+      // DHT Sensor Update: ONLY trigger when Clock Face is "info"
+      if (displayType == "info" && (millis() - lastDHTFirebaseUpdate > 5000)) {
+        lastDHTFirebaseUpdate = millis();
+        HTTPClient dhtHttp;
+        dhtHttp.begin(secureClientCore0, "FIREBASE_DATABASE_URL_HERE/dht.json");
+        dhtHttp.addHeader("Content-Type", "application/json");
+        String payload = "{\"temperature\":" + String(roomTemp, 1) + ",\"humidity\":" + String(roomHum, 1) + "}";
+        dhtHttp.PATCH(payload);
+        dhtHttp.end();
+      }
+    }
+    
+    // Crucial: Yields Core 0 to prevent the ESP32 Watchdog from crashing
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+  }
+}
+
+// =====================================================
+// SETUP 
+// =====================================================
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+  Wire.setClock(400000);
+  
+  display.begin(0x3C, true);
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+
+  // GPIO
+  ledcAttach(RED_PIN, 5000, 8);
+  ledcAttach(GREEN_PIN, 5000, 8);
+  ledcAttach(BLUE_PIN, 5000, 8);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  dht.begin();
+
+  secureClientCore0.setInsecure();
+  secureClientCore1.setInsecure();
+
+  // SD Card
+  if(!SD.begin(SD_CS)){
+    centerText("SD Card Error", 1);
+    delay(3000);
+  }
+
+  // Connect to WiFi, but this can be interrupted by a long press
+  // to enter offline music mode immediately.
+  connectWiFi();
+
+  // If we didn't enter offline mode during boot, start the network task on Core 0.
+  if (!offlineMusicMode) {
+    // Start the Dual-Core Magic
+    xTaskCreatePinnedToCore(
+      firebaseTaskCode,   /* Task function */
+      "FirebaseTask",     /* Name of task */
+      10000,              /* Stack size */
+      NULL,               /* Task parameter */
+      1,                  /* Priority */
+      &firebaseTask,      /* Task handle */
+      0                   /* Pin task to Core 0 */
+    );
+  }
+}
+
+// =====================================================
+// INFO DISPLAY
+// =====================================================
+
+void drawInfoDisplay() {
+  display.clearDisplay();
+  
+  time_t now = getCurrentTime();
+  struct tm* timeinfo = localtime(&now);
+  
+  char dateString[20];
+  strftime(dateString, sizeof(dateString), "%b %d", timeinfo);
+  char dayString[20];
+  strftime(dayString, sizeof(dayString), "%A", timeinfo);
+  
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+  display.println(dateString);
+  
+  display.setCursor(0, 20);
+  display.println(dayString);
+  
+  display.setTextSize(1);
+  display.setCursor(0, 42);
+  display.print("Temp: ");
+  display.print(roomTemp, 1);
+  display.println(" C");
+  
+  display.setCursor(0, 54);
+  display.print("Hum : ");
+  display.print(roomHum, 1);
+  display.println(" %");
+  
+  display.display();
+}
+
+// =====================================================
+// OFFLINE MUSIC - OLED DISPLAY
+// =====================================================
+void drawOfflineMusicScreen() {
+  if (millis() - lastInteractionTime > 300000 && musicPlayerActive) {
+    display.clearDisplay();
+    display.display();
+    lastDisplayedLyric = ""; // Reset to force redraw on wake
+    return;
+  }
+
+  if (musicPlayerActive == lastMusicPlayerActive && currentLyricLine == lastDisplayedLyric) {
+    return; // Optimization: only redraw when needed
+  }
+
+  lastDisplayedLyric = currentLyricLine;
+  lastMusicPlayerActive = musicPlayerActive;
+
+  display.clearDisplay();
+  display.setTextWrap(true);
+  display.setCursor(0, 0);
+
+  if (!musicPlayerActive) {
+    display.setTextSize(1);
+    display.println("SSID: esp32");
+    display.println("PASS: 12345678");
+    display.println("");
+    display.println("IP: " + WiFi.softAPIP().toString());
+    display.println("");
+    display.println("Open website and");
+    display.println("press ENTER...");
+            display.display();
+  } else {
+            String wrappedLyrics = wrapText(currentLyricLine, 21);
+            centerText(wrappedLyrics, 1);
+  }
+}
+
+// =====================================================
+// LOOP (RUNS ON CORE 1)
+// =====================================================
+
+void loop() {
+  handleButton();
+
+  if (offlineMusicMode) {
+    server.handleClient();
+    if (millis() - lastClockDraw > 100) { // Update OLED at 10fps
+      lastClockDraw = millis();
+      drawOfflineMusicScreen();
+    }
+    return; // Skip all normal operations
+  }
+
+  checkWiFi();
+
+  // =====================================================
+  // DHT SENSOR READ (Non-Blocking)
+  // =====================================================
+  if (displayType == "info") {
+    if (millis() - lastDHTRead > 2000) {
+      lastDHTRead = millis();
+      float t = dht.readTemperature();
+      float h = dht.readHumidity();
+      if (!isnan(t)) roomTemp = t;
+      if (!isnan(h)) roomHum = h;
+    }
+  }
+
+  // The rest of the loop is for normal clock operation
+
+  if (isTimerRinging || isAlarmRinging || newMessageAvailable) {
+    lastInteractionTime = millis(); // Wake up OLED instantly
+  }
+
+  bool systemAsleep = false;
+  if (!offlineMusicMode && (millis() - lastInteractionTime > 600000)) { // 10 mins
+    systemAsleep = true;
+  }
+
+  // RINGING ENGINE (NON-BLOCKING)
+  if (isTimerRinging || isAlarmRinging) {
+    unsigned long duration = isTimerRinging ? 5000 : 10000;
+    unsigned long startT = isTimerRinging ? timerRingStart : alarmRingStart;
+
+    if (millis() - startT < duration) {
+      if (millis() - lastRingToggle > 200) {
+        lastRingToggle = millis();
+        ringToggleState = !ringToggleState;
+        if (ringToggleState) {
+          setRGB(255, 0, 0);
+          tone(BUZZER_PIN, 2000);
+          if (isTimerRinging) centerText("DONE", 3);
+          else centerText(alarmMessage, 2);
+        } else {
+          setRGB(0, 0, 0);
+          noTone(BUZZER_PIN);
+          display.clearDisplay();
+          display.display();
+        }
+      }
+      return; // Suspend normal clock execution while UI flashes 
+    } else {
+      isTimerRinging = false;
+      isAlarmRinging = false;
+      setRGB(0, 0, 0);
+      noTone(BUZZER_PIN);
+    }
+  }
+
+  // RGB
+  if (systemAsleep) {
+    setRGB(0, 0, 0);
+  } else if (displayType == "info") {
+    float clampedHum = roomHum;
+    if (clampedHum < 50.0) clampedHum = 50.0;
+    if (clampedHum > 95.0) clampedHum = 95.0;
+    
+    float ratio = (clampedHum - 50.0) / 45.0;
+    int r = (1.0 - ratio) * 255;
+    int b = ratio * 255;
+    setRGB(r, 0, b);
+  } else if (rgbMode == "cycle") {
+    updateRGBCycle();
+  } else if (rgbMode == "solid") {
+    setRGB(solidR, solidG, solidB);
+  } else {
+    setRGB(0,0,0);
+  }
+
+  // MESSAGE
+  if (newMessageAvailable && !timerRunning && !alarmTriggered) {
+    newMessageAvailable = false;
+    messageDisplaying = true;
+    messageStartTime = millis();
+
+    if (wifiConnected) {
+      HTTPClient msgHttp;
+      msgHttp.begin(secureClientCore1, "FIREBASE_DATABASE_URL_HERE/message/new.json");
+      msgHttp.addHeader("Content-Type", "application/json");
+      msgHttp.PUT("false");
+      msgHttp.end();
+
+      lastFirebaseRead = millis(); 
+    }
+  }
+
+  if (messageDisplaying && !timerRunning && !alarmTriggered) {
+    if (millis() - messageStartTime < 15000) {
+      int len = currentMessage.length();
+      int textSize = 1;
+      if (len <= 14) textSize = 3;
+      else if (len <= 40) textSize = 2;
+      
+      centerText(currentMessage, textSize);
+      return; // Pause regular clock drawing while displaying message
+    } else {
+      messageDisplaying = false;
+      display.clearDisplay();
+    }
+  }
+
+  // TIMER
+  if (timerRunning) {
+    
+    while (millis() - lastTimerTick >= 1000) {
+      lastTimerTick += 1000; 
+      timerSeconds--;
+
+      if (timerSeconds <= 0) {
+          timerRunning = false;
+          isTimerRinging = true;
+          timerRingStart = millis();
+        
+        if (wifiConnected) {
+          HTTPClient timerHttp;
+          timerHttp.begin(secureClientCore1, "FIREBASE_DATABASE_URL_HERE/timer/running.json");
+          timerHttp.addHeader("Content-Type", "application/json");
+          timerHttp.PUT("false");
+          timerHttp.end();
+          
+          lastFirebaseRead = millis();
+        }
+        break; 
+      }
+    }
+
+    if (timerRunning) {
+      centerText(String(timerSeconds), 4);
+      delay(50);
+      return;
+    }
+  }
+
+  // TIME
+  time_t now = getCurrentTime();
+  struct tm* timeinfo = localtime(&now);
+  char currentTime[10];
+  
+  strftime(currentTime, sizeof(currentTime), "%H:%M", timeinfo);
+  
+  // ALARM
+  if (alarmEnabled && String(currentTime) == alarmTime && !alarmTriggered && timeinfo->tm_sec == 0) {
+    alarmTriggered = true;
+    isAlarmRinging = true;
+    alarmRingStart = millis();
+  }
+
+  if (timeinfo->tm_sec > 5) {
+    alarmTriggered = false;
+  }
+
+  // HOURLY BEEP
+  if (timeinfo->tm_min == 0 && timeinfo->tm_sec == 0 && millis() - lastHourlyBeep > 60000) {
+    lastHourlyBeep = millis();
+    tone(BUZZER_PIN, 1500);
+    delay(1000);
+    noTone(BUZZER_PIN);
+  }
+
+  // CLOCK
+  if (millis() - lastClockDraw > 1000) {
+    lastClockDraw = millis();
+
+    if (systemAsleep) {
+      display.clearDisplay();
+      display.display();
+    } else if (displayType == "analog") {
+      drawAnalogClock();
+    } else if (displayType == "digital") {
+      drawDigitalClock();
+    } else {
+      drawInfoDisplay();
+    }
+  }
+}
+
+void handleButton() {
+  bool currentButtonState = digitalRead(BUTTON_PIN);
+  if (lastButtonState == HIGH && currentButtonState == LOW) {
+    buttonPressTime = millis();
+    buttonPressed = true;
+    buttonHandled = false;
+    lastInteractionTime = millis(); // Wake up OLED
+  }
+
+  // LONG PRESS (OFFLINE MUSIC MODE TOGGLE)
+  if (buttonPressed && currentButtonState == LOW && !buttonHandled) {
+    if (millis() - buttonPressTime > 3000) {
+      buttonHandled = true;
+      if (!offlineMusicMode) {
+        startOfflineMusicMode();
+      } else {
+        stopOfflineMusicMode();
+      }
+    }
+  }
+
+  // SHORT PRESS (CONTEXT ACTIONS)
+  if (buttonPressed && currentButtonState == HIGH) {
+    buttonPressed = false;
+    if (!buttonHandled && (millis() - buttonPressTime > 50)) { // 50ms Debounce
+      if (offlineMusicMode) return; // Short press does nothing in music mode
+
+      // PRIORITY 1: The Silencer
+      if (isTimerRinging || isAlarmRinging) {
+        isTimerRinging = false;
+        isAlarmRinging = false;
+        setRGB(0,0,0);
+        noTone(BUZZER_PIN);
+        if (wifiConnected) {
+          HTTPClient http;
+          http.begin(secureClientCore1, "FIREBASE_DATABASE_URL_HERE/.json");
+          http.addHeader("Content-Type", "application/json");
+          http.PATCH("{\"timer/running\":false,\"alarm/enabled\":false}");
+          http.end();
+        }
+      } else if (timerRunning) {
+        timerRunning = false;
+        if (wifiConnected) {
+          HTTPClient http;
+          http.begin(secureClientCore1, "FIREBASE_DATABASE_URL_HERE/timer/running.json");
+          http.addHeader("Content-Type", "application/json");
+          http.PUT("false");
+          http.end();
+        }
+      }
+      else {
+        if (displayType == "analog") displayType = "digital";
+        else if (displayType == "digital") displayType = "info";
+        else displayType = "analog";
+
+        if (wifiConnected) {
+          HTTPClient http;
+          http.begin(secureClientCore1, "FIREBASE_DATABASE_URL_HERE/display/type.json");
+          http.addHeader("Content-Type", "application/json");
+          http.PUT("\"" + displayType + "\"");
+          http.end();
+        }
+      }
+    }
+  }
+  lastButtonState = currentButtonState;
+    }
